@@ -377,12 +377,12 @@ async fn main() {
 				// Subreddit post share link
 				Some(id) if (8..12).contains(&id.len()) => match canonical_path(format!("/r/{sub}/s/{id}"), 3).await {
 					Ok(Some(path)) => Ok(redirect(&path)),
-					Ok(None) => error(req, "Post ID is invalid. It may point to a post on a community that has been banned.").await,
+					Ok(None) => error(req, &format!("r/{sub}/s/{id} Post ID is invalid. It may point to a post on a community that has been banned.")).await,
 					Err(e) => error(req, &e).await,
 				},
 
 				// Error message for unknown pages
-				_ => error(req, "Nothing here").await,
+				_ => error(req, &format!("r/{sub} Nothing here")).await,
 			}
 		})
 	});
@@ -393,12 +393,12 @@ async fn main() {
 				// User post share link
 				Some(id) if (8..12).contains(&id.len()) => match canonical_path(format!("/u/{name}/s/{id}"), 3).await {
 					Ok(Some(path)) => Ok(redirect(&path)),
-					Ok(None) => error(req, "Post ID is invalid. It may point to a post on a user that has been banned.").await,
+					Ok(None) => error(req, &format!("u/{name}/s/{id} Post ID is invalid. It may point to a post on a user that has been banned.")).await,
 					Err(e) => error(req, &e).await,
 				},
 
 				// Error message for unknown pages
-				_ => error(req, "Nothing here").await,
+				_ => error(req, &format!("u/{name} Nothing here")).await,
 			}
 		})
 	});
@@ -413,13 +413,13 @@ async fn main() {
 				Some(id) if (5..8).contains(&id.len()) => match canonical_path(format!("/comments/{id}"), 3).await {
 					Ok(path_opt) => match path_opt {
 						Some(path) => Ok(redirect(&path)),
-						None => error(req, "Post ID is invalid. It may point to a post on a community that has been banned.").await,
+						None => error(req, &format!("comments/{id} Post ID is invalid. It may point to a post on a community that has been banned.")).await,
 					},
 					Err(e) => error(req, &e).await,
 				},
 
 				// Error message for unknown pages
-				_ => error(req, "Nothing here").await,
+				_ => error(req, &format!("comments/ Nothing here")).await,
 			}
 		})
 	});
