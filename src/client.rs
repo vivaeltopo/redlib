@@ -13,7 +13,9 @@ use serde_json::Value;
 use std::result::Result;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU16};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
+use wreq::cookie::Jar;
+use wreq::dns::{Addrs, Name, Resolve, Resolving};
 use wreq::redirect::Policy;
 use wreq::{header as wreq_header, Client as WreqClient, EmulationFactory, Method, Response as WreqResponse};
 use wreq_util::{Emulation, EmulationOS, EmulationOption};
@@ -26,6 +28,19 @@ const REDDIT_SHORT_URL_BASE_HOST: &str = "redd.it";
 
 const ALTERNATIVE_REDDIT_URL_BASE: &str = "https://www.reddit.com";
 const ALTERNATIVE_REDDIT_URL_BASE_HOST: &str = "www.reddit.com";
+
+const SHREDDIT_PATH_PREFIX: &str = "/svc/shreddit/";
+// Asks for the bare fragment instead of a full page shell, roughly halving the response.
+const SHREDDIT_PARTIAL_ACCEPT: &str = "text/vnd.reddit.partial+html, text/html;q=0.9";
+// Reddit answers rate-limited shreddit requests with this reCAPTCHA page and a 200 status.
+const SHREDDIT_CHALLENGE_TITLE: &str = "<title>Reddit - Prove your humanity</title>";
+
+// Logged-out reddit.com session shared by shreddit requests. Reddit challenges
+// cookieless clients after about ten requests, but gives each session a budget
+// of a couple hundred requests. It is kept apart from the OAuth API requests on purpose.
+static SHREDDIT_SESSION: LazyLock<Arc<Jar>> = LazyLock::new(Arc::default);
+// Leaves room for the requests already in flight when the session is rotated.
+const SHREDDIT_RATELIMIT_ROTATE_BELOW: f32 = 20.0;
 
 pub static CLIENT: LazyLock<WreqClient> = LazyLock::new(build_client);
 
@@ -207,6 +222,68 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 			res.into_hyper_response()
 		})
 		.map_err(|e| e.to_string())
+}
+
+/// Fetch a server-rendered HTML fragment from Reddit's web frontend.
+///
+/// These are the fragments reddit.com loads for logged-out visitors, so they
+/// are sent without the spoofed OAuth client's headers. A `cursor` turns the
+/// request into the form POST used to expand a "more comments" placeholder.
+pub async fn shreddit_fragment(path: String, cursor: Option<String>) -> Result<String, String> {
+	if !path.starts_with(SHREDDIT_PATH_PREFIX) {
+		return Err(format!("Refusing to fetch non-shreddit path | {path}"));
+	}
+
+	if let Some(body) = shreddit_request(&path, cursor.as_deref()).await? {
+		return Ok(body);
+	}
+
+	warn!("Reddit rate limited the shreddit session, starting a new one");
+	SHREDDIT_SESSION.clear();
+	shreddit_request(&path, cursor.as_deref())
+		.await?
+		.ok_or_else(|| format!("Reddit is rate limiting comment requests. Try refreshing in a few seconds. | {path}"))
+}
+
+/// Returns `Ok(None)` when Reddit rate limits or challenges the session.
+async fn shreddit_request(path: &str, cursor: Option<&str>) -> Result<Option<String>, String> {
+	let url = format!("{ALTERNATIVE_REDDIT_URL_BASE}{path}");
+
+	let builder = match cursor {
+		Some(cursor) => CLIENT
+			.post(&url)
+			.header(wreq_header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+			.body(url::form_urlencoded::Serializer::new(String::new()).append_pair("cursor", cursor).finish()),
+		None => CLIENT.get(&url),
+	};
+
+	let response = builder
+		.header(wreq_header::ACCEPT, SHREDDIT_PARTIAL_ACCEPT)
+		.cookie_provider(Arc::clone(&SHREDDIT_SESSION))
+		.send()
+		.await
+		.map_err(|e| format!("Couldn't send request to Reddit: {e} | {path}"))?;
+
+	let status = response.status();
+	if status == wreq::StatusCode::TOO_MANY_REQUESTS {
+		return Ok(None);
+	}
+	if !status.is_success() {
+		return Err(format!("Reddit returned {status} | {path}"));
+	}
+
+	let remaining = response
+		.headers()
+		.get("x-ratelimit-remaining")
+		.and_then(|value| value.to_str().ok())
+		.and_then(|value| value.parse::<f32>().ok());
+	if remaining.is_some_and(|remaining| remaining < SHREDDIT_RATELIMIT_ROTATE_BELOW) {
+		trace!("Shreddit session rate limit is low ({remaining:?} remaining), starting a new one");
+		SHREDDIT_SESSION.clear();
+	}
+
+	let body = response.text().await.map_err(|e| format!("Failed receiving body from Reddit: {e} | {path}"))?;
+	Ok((!body.contains(SHREDDIT_CHALLENGE_TITLE)).then_some(body))
 }
 
 /// Makes a GET request to Reddit at `path`. By default, this will honor HTTP
@@ -510,6 +587,73 @@ mod tests {
 	use {crate::config::get_setting, sealed_test::prelude::*};
 
 	const POPULAR_URL: &str = "/r/popular/hot.json?&raw_json=1&geo_filter=GLOBAL";
+
+	#[test]
+	fn test_reddit_dns_name_uses_fastly_dualstack_alias() {
+		assert_eq!(reddit_dns_name("www.reddit.com"), ALTERNATIVE_REDDIT_DNS_HOST);
+		assert_eq!(reddit_dns_name("WWW.REDDIT.COM"), ALTERNATIVE_REDDIT_DNS_HOST);
+		assert_eq!(reddit_dns_name("oauth.reddit.com"), "oauth.reddit.com");
+	}
+
+	#[test]
+	fn test_comments_transport_path_encodes_scoped_and_short_routes() {
+		for (path, expected) in [
+			(
+				"/r/rust/comments/18t5968/title/.json?sort=new&raw_json=1",
+				"/r/rust%2Fcomments/18t5968/title/.json?sort=new&raw_json=1",
+			),
+			("/r/rust/comments/18t5968/_/kfbqlbc.json?context=3", "/r/rust%2Fcomments/18t5968/_/kfbqlbc.json?context=3"),
+			("/comments/18t5968.json?raw_json=1", "/comments%2F18t5968.json?raw_json=1"),
+			("/comments/18t5968/_/kfbqlbc.json?context=3", "/comments%2F18t5968/_/kfbqlbc.json?context=3"),
+			("/r/comments/comments/18t5968.json", "/r/comments%2Fcomments/18t5968.json"),
+		] {
+			assert_eq!(comments_transport_path(path), expected);
+			assert_eq!(comments_transport_path(expected), expected, "encoding must be idempotent");
+		}
+	}
+
+	#[test]
+	fn test_comments_transport_path_preserves_other_routes_and_queries() {
+		for path in [
+			"/r/popular/hot.json?after=t3_abc",
+			"/r/rust/comments.json",
+			"/r/rust/commentsXYZ/abc.json",
+			"/r/rust/wiki/comments/abc.json",
+			"/r//comments/abc.json",
+			"/comments/.json",
+			"/comments.json",
+			"/user/example/comments.json",
+			"/user/example/comments/abc.json",
+			"/search.json?q=/r/rust/comments/abc",
+			"https://example.com/r/rust/comments/abc.json",
+			"//example.com/r/rust/comments/abc.json",
+		] {
+			assert!(matches!(comments_transport_path(path), Cow::Borrowed(_)), "{path}");
+		}
+
+		let path = "/r/rust/comments/abc.json?sort=new&context=3&q=a%2Bb&empty=&sort=top";
+		assert_eq!(comments_transport_path(path), "/r/rust%2Fcomments/abc.json?sort=new&context=3&q=a%2Bb&empty=&sort=top");
+	}
+
+	#[test]
+	fn test_comments_logical_path_removes_transport_encoding() {
+		for (path, expected) in [
+			("/r/rust%2Fcomments/18t5968/title/kfbqlbc/", "/r/rust/comments/18t5968/title/kfbqlbc/"),
+			("/r/rust%2fcomments/18t5968/title/kfbqlbc/", "/r/rust/comments/18t5968/title/kfbqlbc/"),
+			("/comments%2F18t5968/title/", "/comments/18t5968/title/"),
+			("/r/rust%2Fwiki/page", "/r/rust%2Fwiki/page"),
+		] {
+			assert_eq!(comments_logical_path(path), expected);
+		}
+	}
+
+	#[tokio::test]
+	async fn test_shreddit_fragment_rejects_other_paths() {
+		for path in ["/api/v1/me", "https://evil.example/svc/shreddit/x", "/svc/shreddit"] {
+			let error = shreddit_fragment(path.to_string(), None).await.unwrap_err();
+			assert!(error.starts_with("Refusing to fetch non-shreddit path"), "{path}: {error}");
+		}
+	}
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn test_rate_limit_check() {
